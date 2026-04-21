@@ -13,11 +13,18 @@ RUN apt-get update && apt-get install -y sudo && \
     rm -rf /var/lib/apt/lists/* && \
     apt-get clean
 
-# Set up oh-my-zsh for devuser
+# Set up oh-my-zsh / editor configs for devuser.
+# .zshrc and .oh-my-zsh live under /root/ in lmsysorg/sglang:dev.
+# .vimrc / .tmux.conf were moved to /opt/sglang/ in upstream PR #16365 and
+# are optional — copy them only if the base image still ships them.
 RUN cp -r /root/.oh-my-zsh /home/devuser/.oh-my-zsh && \
     cp /root/.zshrc /home/devuser/.zshrc && \
-    cp /root/.vimrc /home/devuser/.vimrc && \
-    cp /root/.tmux.conf /home/devuser/.tmux.conf && \
+    for src in /opt/sglang/.vimrc /root/.vimrc; do \
+        [ -f "$src" ] && cp "$src" /home/devuser/.vimrc && break; \
+    done; \
+    for src in /opt/sglang/.tmux.conf /root/.tmux.conf; do \
+        [ -f "$src" ] && cp "$src" /home/devuser/.tmux.conf && break; \
+    done; \
     sed -i 's|/root/.oh-my-zsh|/home/devuser/.oh-my-zsh|g' /home/devuser/.zshrc && \
     chown -R devuser:devuser /home/devuser/
 
