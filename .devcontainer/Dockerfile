@@ -20,11 +20,11 @@ RUN apt-get update && apt-get install -y sudo && \
 RUN cp -r /root/.oh-my-zsh /home/devuser/.oh-my-zsh && \
     cp /root/.zshrc /home/devuser/.zshrc && \
     for src in /opt/sglang/.vimrc /root/.vimrc; do \
-        [ -f "$src" ] && cp "$src" /home/devuser/.vimrc && break; \
-    done; \
+        if [ -f "$src" ]; then cp "$src" /home/devuser/.vimrc; break; fi; \
+    done && \
     for src in /opt/sglang/.tmux.conf /root/.tmux.conf; do \
-        [ -f "$src" ] && cp "$src" /home/devuser/.tmux.conf && break; \
-    done; \
+        if [ -f "$src" ]; then cp "$src" /home/devuser/.tmux.conf; break; fi; \
+    done && \
     sed -i 's|/root/.oh-my-zsh|/home/devuser/.oh-my-zsh|g' /home/devuser/.zshrc && \
     chown -R devuser:devuser /home/devuser/
 
