@@ -1,7 +1,7 @@
 import logging
 import os
 from abc import ABC
-from typing import Callable, Generator, List, Optional
+from typing import Callable, Dict, Generator, List, Optional
 
 import torch
 from torch.func import functional_call
@@ -106,15 +106,62 @@ class OffloaderV1(BaseOffloader):
         if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
             return module
 
+        # Record tensor-attribute aliases of each parameter's *original* storage
+        # BEFORE we rebind .data to pinned CPU memory. Some hybrid models
+        # (e.g. Qwen3-Next, Qwen3.5, Kimi-Linear) cache a `.view()` or
+        # `.squeeze()` of `conv1d.weight` as a plain tensor attribute on a
+        # sibling submodule (e.g. `RadixLinearAttention.conv_weights`). Such a
+        # view snapshots the parameter's *init* storage; once the pin step
+        # reassigns `p.data`, subsequent weight loading writes to the new CPU
+        # storage and the cached view is left pointing at uninitialized GPU
+        # memory. We need to refresh those attributes at forward time so they
+        # view the device tensor produced from the loaded CPU copy.
+        #
+        # Map: (storage_data_ptr of the original GPU .data) -> list of
+        #      (submodule, attr_name, size, stride, offset).
+        # We key by data_ptr because the original GPU storage is kept alive
+        # through the view itself, so its data_ptr remains stable.
+        view_aliases: Dict[int, List] = {}
+        param_data_ptr_to_param = {
+            p.data.untyped_storage().data_ptr(): p for p in module.parameters()
+        }
+        for _sub_name, sub in module.named_modules():
+            for attr_name, attr_val in list(sub.__dict__.items()):
+                if not isinstance(attr_val, torch.Tensor):
+                    continue
+                if isinstance(attr_val, torch.nn.Parameter):
+                    # Already registered as a Parameter — handled by functional_call.
+                    continue
+                try:
+                    ptr = attr_val.untyped_storage().data_ptr()
+                except Exception:
+                    continue
+                if ptr not in param_data_ptr_to_param:
+                    continue
+                view_aliases.setdefault(ptr, []).append(
+                    (
+                        sub,
+                        attr_name,
+                        attr_val.size(),
+                        attr_val.stride(),
+                        attr_val.storage_offset(),
+                    )
+                )
+
         pin_memory = is_pin_memory_available()
         # offload parameters to CPU
         # use pin_memory if possible, which helps cudagraph capture speed
         offloaded_parameters = False
+        # Map param_id -> original-storage data_ptr so the forward closure can
+        # look up any registered view aliases for that parameter.
+        param_id_to_orig_ptr: Dict[int, int] = {}
         for p in module.parameters():
             if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
                 # we use per-parameter offloading
                 # one module might have some parameters offloaded and some not
                 break
+
+            orig_ptr = p.data.untyped_storage().data_ptr()
 
             # `torch.empty_like` does not support `pin_memory` argument
             cpu_data = torch.empty_strided(
@@ -129,19 +176,61 @@ class OffloaderV1(BaseOffloader):
             p.data = cpu_data
             self._cpu_offload_bytes += p.data.numel() * p.data.element_size()
             offloaded_parameters = True
+            if orig_ptr in view_aliases:
+                param_id_to_orig_ptr[id(p)] = orig_ptr
 
         if offloaded_parameters:
             original_forward = module.forward
 
             def forward(*args, **kwargs):
                 module.forward = original_forward
-                device_state = {
-                    # here we blindly call `to(device)`
-                    # if the parameter is already on the device, it will be a no-op
-                    k: v.to(device, non_blocking=True)
-                    for k, v in module.state_dict().items()
-                }
-                output = functional_call(module, device_state, args=args, kwargs=kwargs)
+                # Share one device tensor across tied state_dict paths. Some
+                # models (e.g. Qwen3-Next) register the same nn.Parameter
+                # under both a parent and a child module, so state_dict()
+                # yields multiple keys that point to the same CPU storage.
+                # A naive `.to(device)` per key produces distinct device
+                # tensors, which `functional_call(tie_weights=True)` then
+                # rejects as conflicting values for tied names. `keep_vars=True`
+                # preserves Parameter identity so id() is meaningful here.
+                src_to_dev = {}
+                device_state = {}
+                for k, v in module.state_dict(keep_vars=True).items():
+                    dev = src_to_dev.get(id(v))
+                    if dev is None:
+                        dev = v.to(device, non_blocking=True)
+                        src_to_dev[id(v)] = dev
+                    device_state[k] = dev
+
+                # Re-point any plain-tensor attribute that aliases an offloaded
+                # parameter at the freshly-materialized device tensor, so the
+                # attention backend reads correctly-loaded weights instead of
+                # the original (random, now orphaned) GPU storage.
+                alias_restore = []
+                if param_id_to_orig_ptr:
+                    dev_by_orig_ptr = {
+                        param_id_to_orig_ptr[id(p)]: src_to_dev[id(p)]
+                        for p in module.parameters()
+                        if id(p) in param_id_to_orig_ptr and id(p) in src_to_dev
+                    }
+                    for orig_ptr, dev_tensor in dev_by_orig_ptr.items():
+                        for sub, attr_name, size, stride, offset in view_aliases[
+                            orig_ptr
+                        ]:
+                            old = sub.__dict__.get(attr_name, None)
+                            alias_restore.append((sub, attr_name, old))
+                            sub.__dict__[attr_name] = dev_tensor.as_strided(
+                                size, stride, offset
+                            )
+                try:
+                    output = functional_call(
+                        module, device_state, args=args, kwargs=kwargs
+                    )
+                finally:
+                    for sub, attr_name, old in alias_restore:
+                        if old is None:
+                            sub.__dict__.pop(attr_name, None)
+                        else:
+                            sub.__dict__[attr_name] = old
                 module.forward = forward
                 return output
 
