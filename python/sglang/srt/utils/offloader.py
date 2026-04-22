@@ -207,10 +207,14 @@ class OffloaderV1(BaseOffloader):
                 # the original (random, now orphaned) GPU storage.
                 alias_restore = []
                 if param_id_to_orig_ptr:
+                    # Look up each aliased parameter's materialised device
+                    # tensor directly from the pre-built id map, instead of
+                    # re-iterating module.parameters() (which would scan every
+                    # param in the layer on every forward).
                     dev_by_orig_ptr = {
-                        param_id_to_orig_ptr[id(p)]: src_to_dev[id(p)]
-                        for p in module.parameters()
-                        if id(p) in param_id_to_orig_ptr and id(p) in src_to_dev
+                        orig_ptr: src_to_dev[pid]
+                        for pid, orig_ptr in param_id_to_orig_ptr.items()
+                        if pid in src_to_dev
                     }
                     for orig_ptr, dev_tensor in dev_by_orig_ptr.items():
                         for sub, attr_name, size, stride, offset in view_aliases[
