@@ -175,7 +175,7 @@ class OffloaderV1(BaseOffloader):
                 module.forward = original_forward
                 # Share one device tensor across tied state_dict paths, since
                 # `functional_call(tie_weights=True)` requires tied parameters to be
-                # identical; dedup via id() to avoid duplicate rematerialization.
+                # identical; deduplicate via id() to avoid redundant rematerialization.
                 src_to_dev = {}
                 device_state = {}
                 for k, v in module.state_dict(keep_vars=True).items():
