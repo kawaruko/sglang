@@ -106,21 +106,10 @@ class OffloaderV1(BaseOffloader):
         if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
             return module
 
-        # Record tensor-attribute aliases of each parameter's *original* storage
-        # BEFORE we rebind .data to pinned CPU memory. Some hybrid models
-        # (e.g. Qwen3-Next, Qwen3.5, Kimi-Linear) cache a `.view()` or
-        # `.squeeze()` of `conv1d.weight` as a plain tensor attribute on a
-        # sibling submodule (e.g. `RadixLinearAttention.conv_weights`). Such a
-        # view snapshots the parameter's *init* storage; once the pin step
-        # reassigns `p.data`, subsequent weight loading writes to the new CPU
-        # storage and the cached view is left pointing at uninitialized GPU
-        # memory. We need to refresh those attributes at forward time so they
-        # view the device tensor produced from the loaded CPU copy.
-        #
-        # Map: (storage_data_ptr of the original GPU .data) -> list of
-        #      (submodule, attr_name, size, stride, offset).
-        # We key by data_ptr because the original GPU storage is kept alive
-        # through the view itself, so its data_ptr remains stable.
+        # Record tensor views that alias each parameter's *original* storage
+        # BEFORE we rebind .data to pinned CPU memory. Some hybrid linear-attn
+        # models (e.g. Qwen3-Next) cache such views, which would otherwise point
+        # at orphaned GPU memory after weight loading; we refresh them at forward time.
         view_aliases: Dict[int, List] = {}
         param_data_ptr_to_param = {
             p.data.untyped_storage().data_ptr(): p for p in module.parameters()
@@ -184,14 +173,9 @@ class OffloaderV1(BaseOffloader):
 
             def forward(*args, **kwargs):
                 module.forward = original_forward
-                # Share one device tensor across tied state_dict paths. Some
-                # models (e.g. Qwen3-Next) register the same nn.Parameter
-                # under both a parent and a child module, so state_dict()
-                # yields multiple keys that point to the same CPU storage.
-                # A naive `.to(device)` per key produces distinct device
-                # tensors, which `functional_call(tie_weights=True)` then
-                # rejects as conflicting values for tied names. `keep_vars=True`
-                # preserves Parameter identity so id() is meaningful here.
+                # Share one device tensor across tied state_dict paths, since
+                # `functional_call(tie_weights=True)` requires tied parameters to be
+                # identical; dedup via id() to avoid duplicate rematerialization.
                 src_to_dev = {}
                 device_state = {}
                 for k, v in module.state_dict(keep_vars=True).items():
